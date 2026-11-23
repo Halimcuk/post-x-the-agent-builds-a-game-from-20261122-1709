@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Catch — built from one prompt</title>
+<style>
+  /* Neon Catch: one-file game, no network, no external assets. */
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; background: #070312; overflow: hidden; }
+  body {
+    display: flex; align-items: center; justify-content: center;
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif; color: #eaf6ff;
+  }
+  #wrap { position: relative; width: min(96vw, 960px); aspect-ratio: 16 / 9; }
+  /* ?stage=1 fills the whole window (used when filming the game). */
+  body.stage #wrap { width: 100vw; height: 100vh; }
+  body.stage canvas { border-radius: 0; }
+  body.stage #hint { display: none; }
+  canvas {
+    display: block; width: 100%; height: 100%; border-radius: 14px;
+    background: #070312;
+    box-shadow: 0 0 0 2px #2b0f4d, 0 0 42px rgba(168, 85, 247, .45), 0 0 90px rgba(34, 211, 238, .25);
+    cursor: none;
+  }
+  #hint {
+    position: absolute; left: 0; right: 0; bottom: -30px; text-align: center;
+    font-size: 13px; letter-spacing: .08em; color: #8b7bb8; text-transform: uppercase;
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="960" height="540"></canvas>
+  <div id="hint">Move: &larr; &rarr; keys &middot; mouse &middot; touch &nbsp;|&nbsp; Space to start</div>
+</div>
+<script>
+"use strict";
+/*
+ * NEON CATCH
+ * One prompt: "Build a tiny browser game called 'Neon Catch': a neon arcade
+ * catcher where the player moves a glowing paddle left and right with arrow
+ * keys or mouse/touch to catch falling stars, avoids falling bombs, scores
+ * points, has 3 lives, levels up in speed every 10 catches, shows
+ * score/lives/level, a start screen, game-over screen with restart, all in
+ * one static HTML file with no network."
+ */
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const W = canvas.width, H = canvas.height;
+
+const AUTOPLAY = new URLSearchParams(location.search).get("autoplay") === "1";
+if (new URLSearchParams(location.search).get("stage") === "1") {
+  document.body.classList.add("stage");
+}
+
+const state = {
+  mode: "start",      // "start" | "playing" | "over"
+  score: 0,
+  lives: 3,
+  level: 1,
+  catches: 0,
+  best: 0,
+  time: 0,
+};
+
+// Paddle: a glowing neon bar the player slides along the bottom.
+const paddle = { x: W / 2 - 70, y: H - 46, w: 140, h: 16, speed: 620, targetX: null };
+
+const items = [];      // falling stars and bombs
+const particles = [];  // burst sparks when something is caught or hits
+const bgStars = [];    // twinkling background stars
+
+for (let i = 0; i < 70; i++) {
+  bgStars.push({
+    x: Math.random() * W, y: Math.random() * H,
+    r: Math.random() * 1.8 + 0.4, tw: Math.random() * Math.PI * 2,
+    sp: 0.4 + Math.random() * 1.2,
+  });
+}
+
+const keys = { left: false, right: false };
+
+function rand(min, max) { return min + Math.random() * (max - min); }
+
+function spawnItem() {
+  const bombChance = Math.min(0.12 + state.level * 0.02, 0.32);
+  const isBomb = Math.random() < bombChance;
+  items.push({
+    kind: isBomb ? "bomb" : "star",
+    x: rand(30, W - 30),
+    y: -30,
+    vy: rand(150, 210) + state.level * 26,
+    r: isBomb ? 16 : 14,
+    rot: rand(0, Math.PI * 2),
+    spin: rand(-2.2, 2.2),
+    wob: rand(0, Math.PI * 2),
+  });
+}
+
+function burst(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, Math.PI * 2), s = rand(60, 260);
+    particles.push({
+      x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 60,
+      life: rand(0.35, 0.8), max: 0.8, color, r: rand(1.5, 3.5),
+    });
+  }
+}
+
+function resetGame() {
+  state.score = 0; state.lives = 3; state.level = 1; state.catches = 0;
+  items.length = 0; particles.length = 0;
+  paddle.x = W / 2 - paddle.w / 2; paddle.targetX = null;
+  state.mode = "playing";
+}
+
+function levelUp() {
+  state.level += 1;
+  burst(paddle.x + paddle.w / 2, paddle.y - 10, "#22d3ee", 26);
+}
+
+function loseLife(x, y) {
+  state.lives -= 1;
+  burst(x, y, "#f43f5e", 30);
+  if (state.lives <= 0) {
+    state.mode = "over";
+    state.best = Math.max(state.best, state.score);
+  }
+}
+
+function update(dt) {
+  state.time += dt;
+
+  for (const s of bgStars) { s.tw += dt * s.sp; }
+
+  // Paddle movement: keys, then mouse/touch target, then autoplay demo.
+  if (keys.left) paddle.x -= paddle.speed * dt;
+  if (keys.right) paddle.x += paddle.speed * dt;
+  if (paddle.targetX !== null) {
+    const cx = paddle.x + paddle.w / 2;
+    paddle.x += (paddle.targetX - cx) * Math.min(1, dt * 14);
+    paddle.targetX = null;
+  }
+  if (AUTOPLAY && state.mode === "playing") {
+    // Demo driver: chase the lowest falling star, dodge bombs above the paddle.
+    let best = null;
+    for (const it of items) {
+      if (it.kind !== "star") continue;
+      if (!best || it.y > best.y) best = it;
+    }
+    if (best) {
+      const cx = paddle.x + paddle.w / 2;
+      const dx = best.x - cx;
+      paddle.x += Math.max(-paddle.speed * dt, Math.min(paddle.speed * dt, dx));
+    }
+  }
+  paddle.x = Math.max(6, Math.min(W - paddle.w - 6, paddle.x));
+
+  if (state.mode !== "playing") return;
+
+  // Spawn pacing quickens as the level rises.
+  spawnTimer -= dt;
+  if (spawnTimer <= 0) {
+    spawnItem();
+    spawnTimer = Math.max(0.28, 0.85 - state.level * 0.06);
+  }
+
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    it.y += it.vy * dt;
+    it.rot += it.spin * dt;
+    it.wob += dt * 3;
+    it.x += Math.sin(it.wob) * 18 * dt;
+
+    const px = paddle.x, py = paddle.y;
+    const caught = it.y + it.r >= py && it.y - it.r <= py + paddle.h &&
+                   it.x >= px - 6 && it.x <= px + paddle.w + 6;
+    if (caught) {
+      if (it.kind === "star") {
+        state.score += 10;
+        state.catches += 1;
+        burst(it.x, it.y, "#fde047", 16);
+        if (state.catches % 10 === 0) levelUp();
+      } else {
+        loseLife(it.x, it.y);
+      }
+      items.splice(i, 1);
+      continue;
+    }
+    if (it.y - it.r > H + 10) {
+      if (it.kind === "star") loseLife(it.x, H - 20); // a missed star costs a life
+      items.splice(i, 1);
+    }
+  }
+
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 420 * dt; p.life -= dt;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
+let spawnTimer = 0.6;
+
+function drawStar(x, y, r, rot, color, glow) {
+  ctx.save();
+  ctx.translate(x, y); ctx.rotate(rot);
+  ctx.shadowColor = glow; ctx.shadowBlur = 18;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const rr = i % 2 === 0 ? r : r * 0.45;
+    const a = (i * Math.PI) / 5 - Math.PI / 2;
+    ctx[i === 0 ? "moveTo" : "lineTo"](Math.cos(a) * rr, Math.sin(a) * rr);
+  }
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+function drawBomb(x, y, r, rot) {
+  ctx.save();
+  ctx.translate(x, y); ctx.rotate(rot);
+  ctx.shadowColor = "#f43f5e"; ctx.shadowBlur = 18;
+  ctx.fillStyle = "#1f1020";
+  ctx.strokeStyle = "#fb7185"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  ctx.strokeStyle = "#fda4af"; ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.moveTo(0, -r); ctx.quadraticCurveTo(6, -r - 10, 12, -r - 8); ctx.stroke();
+  ctx.fillStyle = "#fde047";
+  ctx.beginPath(); ctx.arc(12, -r - 8, 3.5, 0, Math.PI * 2); ctx.fill();
+  // skull-ish fuse dots
+  ctx.fillStyle = "#fb7185";
+  ctx.beginPath(); ctx.arc(-5, -3, 2.4, 0, Math.PI * 2); ctx.arc(5, -3, 2.4, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+
+function drawPaddle() {
+  const g = ctx.createLinearGradient(paddle.x, 0, paddle.x + paddle.w, 0);
+  g.addColorStop(0, "#22d3ee"); g.addColorStop(0.5, "#a855f7"); g.addColorStop(1, "#ec4899");
+  ctx.save();
+  ctx.shadowColor = "#a855f7"; ctx.shadowBlur = 24;
+  ctx.fillStyle = g;
+  roundRect(paddle.x, paddle.y, paddle.w, paddle.h, 8);
+  ctx.fill();
+  ctx.restore();
+  ctx.fillStyle = "rgba(255,255,255,.85)";
+  roundRect(paddle.x + 14, paddle.y + 5, paddle.w - 28, 3, 2);
+  ctx.fill();
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawHUD() {
+  ctx.font = "700 22px 'Segoe UI', system-ui, sans-serif";
+  ctx.textAlign = "left"; ctx.textBaseline = "top";
+  ctx.fillStyle = "#eaf6ff";
+  ctx.fillText("SCORE  " + state.score, 18, 16);
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#22d3ee";
+  ctx.fillText("LEVEL " + state.level, W / 2, 16);
+  ctx.textAlign = "right";
+  ctx.fillStyle = state.lives === 1 ? "#fb7185" : "#fda4af";
+  ctx.fillText("♥ ".repeat(state.lives) + "♡".repeat(Math.max(0, 3 - state.lives)), W - 18, 16);
+}
+
+function drawCenter(title, lines, accent) {
+  ctx.fillStyle = "rgba(7,3,18,.72)";
+  roundRect(W / 2 - 300, H / 2 - 118, 600, 236, 18);
+  ctx.fill();
+  ctx.strokeStyle = accent; ctx.lineWidth = 2;
+  ctx.shadowColor = accent; ctx.shadowBlur = 16;
+  roundRect(W / 2 - 300, H / 2 - 118, 600, 236, 18);
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = accent;
+  ctx.font = "800 54px 'Segoe UI', system-ui, sans-serif";
+  ctx.fillText(title, W / 2, H / 2 - 58);
+  ctx.fillStyle = "#eaf6ff";
+  ctx.font = "400 20px 'Segoe UI', system-ui, sans-serif";
+  lines.forEach((ln, i) => ctx.fillText(ln, W / 2, H / 2 + 2 + i * 30));
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, "#0b0620"); bg.addColorStop(1, "#070312");
+  ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+
+  for (const s of bgStars) {
+    ctx.globalAlpha = 0.25 + 0.55 * Math.abs(Math.sin(s.tw));
+    ctx.fillStyle = "#c4b5fd";
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  if (state.mode === "playing" || state.mode === "over") {
+    for (const it of items) {
+      if (it.kind === "star") drawStar(it.x, it.y, it.r, it.rot, "#fde047", "#facc15");
+      else drawBomb(it.x, it.y, it.r, it.rot);
+    }
+    for (const p of particles) {
+      ctx.globalAlpha = Math.max(0, p.life / p.max);
+      ctx.fillStyle = p.color;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    drawPaddle();
+    drawHUD();
+  }
+
+  if (state.mode === "start") {
+    drawStar(W / 2, H / 2 - 150, 26, state.time * 0.6, "#fde047", "#facc15");
+    drawCenter("NEON CATCH", [
+      "Catch the falling stars. Dodge the bombs.",
+      "10 catches = level up. 3 lives. How far can you go?",
+      "Press SPACE or click to start",
+    ], "#a855f7");
+  } else if (state.mode === "over") {
+    drawCenter("GAME OVER", [
+      "Score: " + state.score + "   •   Level " + state.level + "   •   Best " + state.best,
+      "Press R or click to play again",
+    ], "#f43f5e");
+  }
+}
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// Controls: arrows, mouse, touch, space / R / click.
+addEventListener("keydown", (e) => {
+  if (e.code === "ArrowLeft") { keys.left = true; e.preventDefault(); }
+  if (e.code === "ArrowRight") { keys.right = true; e.preventDefault(); }
+  if (e.code === "Space" || e.code === "Enter") {
+    if (state.mode !== "playing") resetGame();
+    e.preventDefault();
+  }
+  if (e.code === "KeyR" && state.mode === "over") resetGame();
+});
+addEventListener("keyup", (e) => {
+  if (e.code === "ArrowLeft") keys.left = false;
+  if (e.code === "ArrowRight") keys.right = false;
+});
+function pointToX(clientX) {
+  const rect = canvas.getBoundingClientRect();
+  return ((clientX - rect.left) / rect.width) * W;
+}
+canvas.addEventListener("mousemove", (e) => { paddle.targetX = pointToX(e.clientX); });
+canvas.addEventListener("touchmove", (e) => {
+  paddle.targetX = pointToX(e.touches[0].clientX);
+  e.preventDefault();
+}, { passive: false });
+canvas.addEventListener("click", () => {
+  if (state.mode !== "playing") resetGame();
+});
+
+// Test hook: lets an automated play-test read the live state.
+window.__neonCatch = {
+  state, paddle, items,
+  start: resetGame,
+};
+</script>
+</body>
+</html>
